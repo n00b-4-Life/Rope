@@ -49,18 +49,17 @@ def coordinator():
             vm.play_video(action[0][1])
             action.pop(0)
         elif action[0][0] == "get_requested_video_frame":
-            vm.get_requested_video_frame(action[0][1], marker=False)
+            vm.get_requested_video_frame(action[0][1], marker=True)
             action.pop(0)
         elif action[0][0] == "get_requested_video_frame_without_markers":
             vm.get_requested_video_frame(action[0][1], marker=False)
-            action.pop(0)    
+            action.pop(0)
         elif action[0][0] == "get_requested_image":
             vm.get_requested_image()
             action.pop(0)            
-        elif action[0][0] == "swap":
-
-            vm.swap = action[0][1]
-            action.pop(0)
+        # elif action[0][0] == "swap":
+        #     vm.swap = action[0][1]
+        #     action.pop(0)
         elif action[0][0] == "target_faces":
             vm.assign_found_faces(action[0][1])
             action.pop(0)
@@ -110,7 +109,9 @@ def coordinator():
         elif action[0][0] == "set_slider_length":
             gui.set_video_slider_length(action[0][1])
             action.pop(0)
-
+        elif action[0][0] == "update_markers_canvas":
+            gui.update_markers_canvas()
+            action.pop(0)
           
             
         else:

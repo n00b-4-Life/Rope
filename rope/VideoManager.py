@@ -1,5 +1,6 @@
 import os
 import cv2
+import json
 import tkinter as tk
 from PIL import Image, ImageTk
 import threading
@@ -19,7 +20,7 @@ from torchvision.transforms import v2
 torch.set_grad_enabled(False)
 onnxruntime.set_default_logger_severity(4)
 
-# import inspect #print(inspect.currentframe().f_back.f_code.co_name, 'resize_image')
+import inspect #print(inspect.currentframe().f_back.f_code.co_name, 'resize_image')
 
 device = 'cuda'
 
@@ -51,7 +52,8 @@ class VideoManager():
         self.current_frame = 0              # the current frame of the video
         self.create_video = False
         self.output_video = []       
-        self.file_name = []       
+        self.file_name = []
+        self.track = []
 
         
         # Play related
@@ -100,6 +102,7 @@ class VideoManager():
         self.is_image_loaded = False
         self.stop_marker = -1
         self.perf_test = False
+
         self.control = []
 
         
@@ -150,6 +153,7 @@ class VideoManager():
             self.r_frame_q = []             
             self.found_faces = []
             self.add_action("set_slider_length",self.video_frame_total-1)
+            self.add_action("update_markers_canvas", self.markers)
 
         self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)        
         success, image = self.capture.read() 
@@ -178,6 +182,7 @@ class VideoManager():
     
     ## Action queue
     def add_action(self, action, param):
+        # print(inspect.currentframe().f_back.f_code.co_name, '->add_action: '+action)
         temp = [action, param]
         self.action_q.append(temp)    
     
@@ -224,13 +229,13 @@ class VideoManager():
                 target_image = cv2.cvtColor(target_image, cv2.COLOR_BGR2RGB) #RGB 
                 if not self.control['SwapFacesButton']:   
                     temp = [target_image, self.current_frame] #temp = RGB
-                else:  
+                else:
                     temp = [self.swap_video(target_image, self.current_frame, marker), self.current_frame] # temp = RGB
 
                 self.r_frame_q.append(temp)  
         
-        elif self.is_image_loaded == True:
-            if not self.control['SwapFacesButton']:   
+        elif self.is_image_loaded:
+            if not self.control['SwapFacesButton']:
                 temp = [self.image, self.current_frame] # image = RGB
         
             else:  
@@ -252,7 +257,8 @@ class VideoManager():
         return index, min_frame
 
 
-    def play_video(self, command):        
+    def play_video(self, command):
+        # print(inspect.currentframe().f_back.f_code.co_name, '->play_video: ')
         if command == "play":
             # Initialization
             self.play = True
@@ -260,7 +266,7 @@ class VideoManager():
             self.process_qs = []
             self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
             self.frame_timer = time.time()
-            
+            self.track.clear()
             # Create reusable queue based on number of threads
             for i in range(self.parameters['ThreadsSlider']):
                     new_process_q = self.process_q.copy()
@@ -309,18 +315,21 @@ class VideoManager():
             
             if self.control['AudioButton']:    
                 self.audio_sp.terminate()
+
+            torch.cuda.empty_cache()
                 
         elif command=='stop_from_gui':
             self.play = False
-            
+
+            # Find the lowest frame in the current render queue and set the current frame to the one before it
             index, min_frame = self.find_lowest_frame(self.process_qs)
-            
             if index != -1:
                 self.current_frame = min_frame-1   
             
             if self.control['AudioButton']:    
                 self.audio_sp.terminate()
 
+            torch.cuda.empty_cache()
 
         elif command == "record":
             self.record = True
@@ -328,7 +337,7 @@ class VideoManager():
             self.total_thread_time = 0.0
             self.process_qs = []
             self.capture.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-            
+            print(f"Current Frame: {self.current_frame}")
             for i in range(self.parameters['ThreadsSlider']):
                     new_process_q = self.process_q.copy()
                     self.process_qs.append(new_process_q)
@@ -375,6 +384,7 @@ class VideoManager():
         if self.play == True and self.is_video_loaded == True:
             for item in self.process_qs:
                 if item['Status'] == 'clear' and self.current_frame < self.video_frame_total:
+
                     item['Thread'] = threading.Thread(target=self.thread_video_read, args = [self.current_frame]).start()
                     item['FrameNumber'] = self.current_frame
                     item['Status'] = 'started'
@@ -437,17 +447,21 @@ class VideoManager():
                     # Close video and process
                     if self.process_qs[index]['FrameNumber'] >= self.video_frame_total-1 or self.process_qs[index]['FrameNumber'] == self.stop_marker or self.play == False:
                         self.play_video("stop")
+                        print("video stopped")
+
                         stop_time = float(self.capture.get(cv2.CAP_PROP_POS_FRAMES) / float(self.fps))
+                        print("stop time registered")
                         if stop_time == 0:
                             stop_time = float(self.video_frame_total) / float(self.fps)
-                        
-                        if self.parameters['RecordTypeTextSel']=='FFMPEG':
+                        print("second stop time calculated")
+                        if self.parameters['RecordTypeTextSel']=='OPENCV':
+                            self.sp.release()
+                        elif self.parameters['RecordTypeTextSel'] == 'FFMPEG':
                             self.sp.stdin.close()
                             self.sp.wait()
-                        elif self.parameters['RecordTypeTextSel']=='OPENCV':    
-                            self.sp.release()
-
+                        print("sp released")
                         orig_file = self.target_video
+                        print("orig_file defined")
                         final_file = self.output+self.file_name[1]
                         print("adding audio...")    
                         args = ["ffmpeg",
@@ -463,7 +477,42 @@ class VideoManager():
                         four = subprocess.run(args)
                         os.remove(self.temp_file)
 
-                        timef= time.time() - self.timer 
+                        # ✅ Save similarity tracking JSON here (append + skip duplicates + sort)
+                        try:
+                            if hasattr(self, "track") and isinstance(self.track, list) and len(self.track) > 0:
+                                base, _ = os.path.splitext(os.path.basename(orig_file))
+                                dest_dir = os.path.dirname(orig_file)
+                                json_path = os.path.join(dest_dir, base + "_times.json")
+
+                                # Load existing data if file exists
+                                if os.path.isfile(json_path):
+                                    with open(json_path, 'r') as f:
+                                        existing_data = json.load(f)
+                                else:
+                                    existing_data = []
+
+                                # Collect existing frame numbers for fast lookup
+                                existing_frames = {entry["frame"] for entry in existing_data}
+
+                                # Only keep new entries that aren't already in the file
+                                new_entries = [entry for entry in self.track if entry["frame"] not in existing_frames]
+
+                                if new_entries:
+                                    combined = existing_data + new_entries
+                                    # Sort all entries by frame number
+                                    combined.sort(key=lambda x: x["frame"])
+
+                                    with open(json_path, 'w') as f:
+                                        json.dump(combined, f, indent=2)
+                                    print(f"Appended {len(new_entries)} new frame(s) to: {json_path}")
+                                else:
+                                    print("No new frames to append. JSON file unchanged.")
+
+                                self.track.clear()
+                        except Exception as e:
+                            print(f"[Warning] Failed to save similarity tracking JSON: {e}")
+
+                        timef= time.time() - self.timer
                         self.record = False
                         print('Video saved as:', final_file)
                         msg = "Total time: %s s." % (round(timef,1))
@@ -487,7 +536,7 @@ class VideoManager():
             
             else:
                 temp = [self.swap_video(target_image, frame_number, True), frame_number]
-            
+
             for item in self.process_qs:
                 if item['FrameNumber'] == frame_number:
                     item['ProcessedFrame'] = temp[0]
@@ -495,124 +544,590 @@ class VideoManager():
                     item['ThreadTime'] = time.time() - item['ThreadTime']
                     break
 
+    def detect_face_rotation(self, face_kps):
+        """
+        Detects the face rotation angle using the same similarity transform logic as `recognize()`,
+        without modifying the `recognize()` function.
+
+        Parameters:
+            face_kps (numpy.ndarray): 5 facial keypoints [(left_eye), (right_eye), (nose), (left_mouth), (right_mouth)]
+
+        Returns:
+            float: Rotation angle in degrees. Positive = counterclockwise, Negative = clockwise.
+        """
+
+        # Copy the ArcFace reference keypoints
+        dst = self.arcface_dst.copy()
+        dst[:, 0] += 8.0  # Small shift to match ArcFace standard alignment
+
+        # Estimate transformation
+        tform = trans.SimilarityTransform()
+        tform.estimate(face_kps, dst)
+
+        # Extract the rotation angle (in degrees)
+        rotation_angle = tform.rotation * 57.2958  # Convert radians to degrees
+
+        return rotation_angle
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
     # @profile
-    def swap_video(self, target_image, frame_number, use_markers):   
+
+    # @profile
+    def swap_video_orig(self, target_image, frame_number, use_markers):
+
         # Grab a local copy of the parameters to prevent threading issues
         parameters = self.parameters.copy()
         control = self.control.copy()
-        
+
+        # Define the specific parameters to copy
+        desired_parameters = {'OrientSwitch', 'OrientSlider', 'MouthParserSlider'}
+
         # Find out if the frame is in a marker zone and copy the parameters if true
         if self.markers and use_markers:
             temp=[]
             for i in range(len(self.markers)):
                 temp.append(self.markers[i]['frame'])
+
             idx = bisect.bisect(temp, frame_number)
-            
-            parameters = self.markers[idx-1]['parameters'].copy()
-        
+
+            if frame_number in temp:
+                idx = temp.index(frame_number)  # Get the exact index of the frame in the markers list
+                print("idx:", idx)
+                for key in desired_parameters:
+                    if key in self.markers[idx]['parameters']:
+                        parameters[key] = self.markers[idx]['parameters'][key]
+                        print("Updating", key, "to", parameters[key])
+
         # Load frame into VRAM
-        img = torch.from_numpy(target_image).to('cuda') #HxWxc
-        img = img.permute(2,0,1)#cxHxW        
-        
+        img = torch.from_numpy(target_image.astype('uint8')).to('cuda') #HxWxc
+        img = img.permute(2,0,1)#cxHxW
+
         #Scale up frame if it is smaller than 512
         img_x = img.size()[2]
         img_y = img.size()[1]
-        
+
         if img_x<512 and img_y<512:
-            # if x is smaller, set x to 512
             if img_x <= img_y:
                 tscale = v2.Resize((int(512*img_y/img_x), 512), antialias=True)
             else:
                 tscale = v2.Resize((512, int(512*img_x/img_y)), antialias=True)
-
             img = tscale(img)
-            
         elif img_x<512:
             tscale = v2.Resize((int(512*img_y/img_x), 512), antialias=True)
             img = tscale(img)
-        
         elif img_y<512:
             tscale = v2.Resize((512, int(512*img_x/img_y)), antialias=True)
-            img = tscale(img)    
+            img = tscale(img)
 
         # Rotate the frame
         if parameters['OrientSwitch']:
             img = v2.functional.rotate(img, angle=parameters['OrientSlider'], interpolation=v2.InterpolationMode.BILINEAR, expand=True)
 
         # Find all faces in frame and return a list of 5-pt kpss
-        kpss = self.func_w_test("detect", self.models.run_detect, img, parameters['DetectTypeTextSel'], max_num=20, score=parameters['DetectScoreSlider']/100.0)      
+        kpss = self.func_w_test("detect", self.models.run_detect, img, parameters['DetectTypeTextSel'], max_num=50,
+                                score=parameters['DetectScoreSlider'] / 100.0)
 
-        # Get embeddings for all faces found in the fram
         ret = []
-        for i in range(kpss.shape[0]):
-            if kpss is not None:
-                face_kps = kpss[i]
+        angles = []
+        for face_kps in kpss:
+            if face_kps is not None:
+                face_emb, _ = self.func_w_test('recognize', self.models.run_recognize, img, face_kps)
+                ret.append([face_kps, face_emb])
+                rotation_angle = self.detect_face_rotation(face_kps)
+                angles.append(rotation_angle)
 
-            face_emb, _ = self.func_w_test('recognize',  self.models.run_recognize, img, face_kps)
-
-            ret.append([face_kps, face_emb])
-        
         if ret:
-            # Loop through target faces to see if they match our found face embeddings
-            for fface in ret:
-                for found_face in self.found_faces:
-                    # sim between face in video and already found face
-                    sim = self.findCosineDistance(fface[1], found_face["Embedding"])
-                    # if the face[i] in the frame matches afound face[j] AND the found face is active (not []) 
-                    threshhold = parameters["ThresholdSlider"]/100.0
-                    # if parameters["ThresholdState"]:
-                        # threshhold = 2.0
-    
-                    if sim<float(threshhold) and found_face["SourceFaceAssignments"]:
-                        s_e = found_face["AssignedEmbedding"]
-                        img = self.func_w_test("swap_video", self.swap_core, img, fface[0], s_e, parameters, control)
-                        # img = img.permute(2,0,1)
-                    
-            img = img.permute(1,2,0)
-            if not control['MaskViewButton'] and parameters['OrientSwitch']:
-                img = img.permute(2,0,1)
-                img = transforms.functional.rotate(img, angle=-parameters['OrientSlider'], expand=True)
-                img = img.permute(1,2,0)
+            if parameters["ThresholdSlider"] == 0:
+                best_matches = []
+                if self.found_faces:
+                    assigned_faces = [ff for ff in self.found_faces if ff["SourceFaceAssignments"]]
+                    if assigned_faces:
+                        s_e = assigned_faces[0]["AssignedEmbedding"]
+                        for i, (face_kps, _) in enumerate(ret):
+                            best_matches.append(([face_kps, None], assigned_faces[0], angles[i]))
 
+                self.track.append({
+                    "frame": frame_number,
+                    "target_face_count": len(ret),
+                    "faces_swapped": len(best_matches),
+                    "similarities": [
+                        {"source_index": 0, "sim": 100.0}
+                    ] * len(best_matches),
+                    "angles": [
+                        {"source_index": 0, "angle": angle} for (_, _, angle) in best_matches
+                    ]
+                })
+
+            else:
+                best_matches = []
+                max_sims_per_source = {
+                    i: 0.0 for i, ff in enumerate(self.found_faces) if ff["SourceFaceAssignments"]
+                }
+                match_angles = []
+
+                for i, fface in enumerate(ret):
+                    best_sim = 0.0
+                    best_match = None
+                    best_src_idx = None
+
+                    for source_index, found_face in enumerate(self.found_faces):
+                        if not found_face["SourceFaceAssignments"]:
+                            continue
+
+                        sim = self.findCosineDistance(fface[1], found_face["Embedding"])
+                        threshold = float(parameters["ThresholdSlider"])
+
+                        if sim > max_sims_per_source[source_index]:
+                            max_sims_per_source[source_index] = sim
+
+                        if sim > best_sim and sim >= threshold:
+                            best_sim = sim
+                            best_match = (fface, found_face, angles[i])
+                            best_src_idx = source_index
+
+                    if best_match:
+                        best_matches.append(best_match)
+                        match_angles.append({"source_index": best_src_idx, "angle": angles[i]})
+
+                self.track.append({
+                    "frame": frame_number,
+                    "target_face_count": len(ret),
+                    "faces_swapped": len(best_matches),
+                    "similarities": [
+                        {"source_index": idx, "sim": sim}
+                        for idx, sim in max_sims_per_source.items()
+                    ],
+                    "angles": match_angles
+                })
+
+            for fface, found_face, _ in best_matches:
+                s_e = found_face["AssignedEmbedding"]
+                img = self.func_w_test("swap_video", self.swap_core, img, fface[0], s_e, parameters, control)
+
+            img = img.permute(1, 2, 0)
+            if not control['MaskViewButton'] and parameters['OrientSwitch']:
+                img = img.permute(2, 0, 1)
+                img = transforms.functional.rotate(img, angle=-parameters['OrientSlider'], expand=True)
+                img = img.permute(1, 2, 0)
         else:
+            max_sims_per_source = {
+                i: 0.0 for i, ff in enumerate(self.found_faces) if ff["SourceFaceAssignments"]
+            }
+
+            self.track.append({
+                "frame": frame_number,
+                "target_face_count": 0,
+                "faces_swapped": 0,
+                "similarities": [
+                    {"source_index": idx, "sim": 0.0}
+                    for idx in max_sims_per_source
+                ],
+                "angles": []
+            })
+
             img = img.permute(1,2,0)
             if parameters['OrientSwitch']:
                 img = img.permute(2,0,1)
                 img = v2.functional.rotate(img, angle=-parameters['OrientSlider'], interpolation=v2.InterpolationMode.BILINEAR, expand=True)
                 img = img.permute(1,2,0)
-        
+
         if self.perf_test:
-            print('------------------------')  
-        
-        # Unscale small videos
+            print('------------------------')
+
         if img_x <512 or img_y < 512:
             tscale = v2.Resize((img_y, img_x), antialias=True)
             img = img.permute(2,0,1)
             img = tscale(img)
             img = img.permute(1,2,0)
-            
 
-        img = img.cpu().numpy()  
-
-        # for kpoint in fface[0]:            
-            # img[int(kpoint[1])][int(kpoint[0])][0] = 255
-            # img[int(kpoint[1])][int(kpoint[0])][1] = 255
-            # img[int(kpoint[1])][int(kpoint[0])][2] = 255
-
-        
+        img = img.cpu().numpy()
         return img.astype(np.uint8)
 
-    def findCosineDistance(self, vector1, vector2):
-        vec1 = vector1.flatten()
-        vec2 = vector2.flatten()
+    # @profile
+    def swap_video_orig2(self, target_image, frame_number, use_markers):
 
-        a = np.dot(vec1.T, vec2)
-        b = np.dot(vec1.T, vec1)
-        c = np.dot(vec2.T, vec2)
-        return 1 - (a/(np.sqrt(b)*np.sqrt(c)))
+        parameters = self.parameters.copy()
+        control = self.control.copy()
+
+        desired_parameters = {'OrientSwitch', 'OrientSlider', 'MouthParserSlider'}
+
+        if self.markers and use_markers:
+            temp = [marker['frame'] for marker in self.markers]
+            idx = bisect.bisect(temp, frame_number)
+
+            if frame_number in temp:
+                idx = temp.index(frame_number)
+                for key in desired_parameters:
+                    if key in self.markers[idx]['parameters']:
+                        parameters[key] = self.markers[idx]['parameters'][key]
+
+        img = torch.from_numpy(target_image.astype('uint8')).to('cuda')
+        img = img.permute(2, 0, 1)
+
+        img_x = img.size()[2]
+        img_y = img.size()[1]
+
+        if img_x < 512 or img_y < 512:
+            if img_x <= img_y:
+                tscale = v2.Resize((int(512 * img_y / img_x), 512), antialias=True)
+            else:
+                tscale = v2.Resize((512, int(512 * img_x / img_y)), antialias=True)
+            img = tscale(img)
+
+        if parameters['OrientSwitch']:
+            img = v2.functional.rotate(img, angle=parameters['OrientSlider'], interpolation=v2.InterpolationMode.BILINEAR, expand=True)
+
+        kpss = self.func_w_test("detect", self.models.run_detect, img, parameters['DetectTypeTextSel'], max_num=50,
+                                score=parameters['DetectScoreSlider'] / 100.0)
+
+        ret = []
+        angles = []
+        for face_kps in kpss:
+            if face_kps is not None:
+                face_emb, _ = self.func_w_test('recognize', self.models.run_recognize, img, face_kps)
+                ret.append([face_kps, face_emb])
+                angles.append(self.detect_face_rotation(face_kps))
+
+        if ret:
+            if parameters["ThresholdSlider"] == 0:
+                best_matches = []
+                if self.found_faces:
+                    assigned_faces = [ff for ff in self.found_faces if ff["SourceFaceAssignments"]]
+                    if assigned_faces:
+                        s_e = assigned_faces[0]["AssignedEmbedding"]
+                        for i, (face_kps, _) in enumerate(ret):
+                            best_matches.append(([face_kps, None], assigned_faces[0], angles[i]))
+
+                self.track.append({
+                    "frame": frame_number,
+                    "target_face_count": len(ret),
+                    "faces_swapped": len(best_matches),
+                    "similarities": [
+                        {"source_index": 0, "sim": 100.0}
+                    ] * len(best_matches),
+                    "angles": [
+                        {"source_index": 0, "angle": angle} for (_, _, angle) in best_matches
+                    ]
+                })
+
+            else:
+                best_matches = []
+                max_sims_per_source = {
+                    i: 0.0 for i, ff in enumerate(self.found_faces) if ff["SourceFaceAssignments"]
+                }
+                match_angles = []
+                matched_indices = set()
+
+                for i, fface in enumerate(ret):
+                    best_sim = 0.0
+                    best_match = None
+                    best_src_idx = None
+
+                    for source_index, found_face in enumerate(self.found_faces):
+                        if not found_face["SourceFaceAssignments"]:
+                            continue
+
+                        sim = self.findCosineDistance(fface[1], found_face["Embedding"])
+                        threshold = float(parameters["ThresholdSlider"])
+
+                        if sim > max_sims_per_source[source_index]:
+                            max_sims_per_source[source_index] = sim
+
+                        if sim > best_sim and sim >= threshold:
+                            best_sim = sim
+                            best_match = (fface, found_face, angles[i])
+                            best_src_idx = source_index
+
+                    if best_match:
+                        best_matches.append(best_match)
+                        match_angles.append({"source_index": best_src_idx, "angle": angles[i]})
+                        matched_indices.add(i)
+
+                # Fallback for 2 target, 2 source, 1 matched case
+                if (
+                    parameters["ThresholdSlider"] > 0 and
+                    len(ret) == 2 and
+                    len([ff for ff in self.found_faces if ff["SourceFaceAssignments"]]) == 2 and
+                    len(best_matches) == 1
+                ):
+                    fallback_idx = (set([0, 1]) - matched_indices).pop()
+                    fface = ret[fallback_idx]
+                    fallback_angle = angles[fallback_idx]
+
+                    for source_index, found_face in enumerate(self.found_faces):
+                        if not found_face["SourceFaceAssignments"]:
+                            continue
+
+                        sim = self.findCosineDistance(fface[1], found_face["Embedding"])
+                        if sim > 40.0:
+                            best_matches.append((fface, found_face, fallback_angle))
+                            match_angles.append({"source_index": source_index, "angle": fallback_angle})
+                            break
+
+                self.track.append({
+                    "frame": frame_number,
+                    "target_face_count": len(ret),
+                    "faces_swapped": len(best_matches),
+                    "similarities": [
+                        {"source_index": idx, "sim": sim}
+                        for idx, sim in max_sims_per_source.items()
+                    ],
+                    "angles": match_angles
+                })
+
+            for fface, found_face, _ in best_matches:
+                s_e = found_face["AssignedEmbedding"]
+                img = self.func_w_test("swap_video", self.swap_core, img, fface[0], s_e, parameters, control)
+
+            img = img.permute(1, 2, 0)
+            if not control['MaskViewButton'] and parameters['OrientSwitch']:
+                img = img.permute(2, 0, 1)
+                img = transforms.functional.rotate(img, angle=-parameters['OrientSlider'], expand=True)
+                img = img.permute(1, 2, 0)
+        else:
+            max_sims_per_source = {
+                i: 0.0 for i, ff in enumerate(self.found_faces) if ff["SourceFaceAssignments"]
+            }
+
+            self.track.append({
+                "frame": frame_number,
+                "target_face_count": 0,
+                "faces_swapped": 0,
+                "similarities": [
+                    {"source_index": idx, "sim": 0.0} for idx in max_sims_per_source
+                ],
+                "angles": []
+            })
+
+            img = img.permute(1, 2, 0)
+            if parameters['OrientSwitch']:
+                img = img.permute(2, 0, 1)
+                img = v2.functional.rotate(img, angle=-parameters['OrientSlider'], interpolation=v2.InterpolationMode.BILINEAR, expand=True)
+                img = img.permute(1, 2, 0)
+
+        if self.perf_test:
+            print('------------------------')
+
+        if img_x < 512 or img_y < 512:
+            tscale = v2.Resize((img_y, img_x), antialias=True)
+            img = img.permute(2, 0, 1)
+            img = tscale(img)
+            img = img.permute(1, 2, 0)
+
+        img = img.cpu().numpy()
+        return img.astype(np.uint8)
+
+
+    # @profile
+    def swap_video(self, target_image, frame_number, use_markers):
+
+        parameters = self.parameters.copy()
+        control = self.control.copy()
+
+        desired_parameters = {'OrientSwitch', 'OrientSlider', 'MouthParserSlider'}
+
+        if self.markers and use_markers:
+            temp = [marker['frame'] for marker in self.markers]
+            idx = bisect.bisect(temp, frame_number)
+
+            if frame_number in temp:
+                idx = temp.index(frame_number)
+                for key in desired_parameters:
+                    if key in self.markers[idx]['parameters']:
+                        parameters[key] = self.markers[idx]['parameters'][key]
+
+        img = torch.from_numpy(target_image.astype('uint8')).to('cuda')
+        img = img.permute(2, 0, 1)
+
+        img_x = img.size()[2]
+        img_y = img.size()[1]
+
+        if img_x < 512 or img_y < 512:
+            if img_x <= img_y:
+                tscale = v2.Resize((int(512 * img_y / img_x), 512), antialias=True)
+            else:
+                tscale = v2.Resize((512, int(512 * img_x / img_y)), antialias=True)
+            img = tscale(img)
+
+        if parameters['OrientSwitch']:
+            img = v2.functional.rotate(img, angle=parameters['OrientSlider'], interpolation=v2.InterpolationMode.BILINEAR, expand=True)
+
+        kpss = self.func_w_test("detect", self.models.run_detect, img, parameters['DetectTypeTextSel'], max_num=50,
+                                score=parameters['DetectScoreSlider'] / 100.0)
+
+        ret = []
+        angles = []
+        for face_kps in kpss:
+            if face_kps is not None:
+                face_emb, _ = self.func_w_test('recognize', self.models.run_recognize, img, face_kps)
+                ret.append([face_kps, face_emb])
+                angles.append(self.detect_face_rotation(face_kps))
+
+        if ret:
+            if parameters["ThresholdSlider"] == 0:
+                best_matches = []
+                if self.found_faces:
+                    assigned_faces = [ff for ff in self.found_faces if ff["SourceFaceAssignments"]]
+                    if assigned_faces:
+                        s_e = assigned_faces[0]["AssignedEmbedding"]
+                        for i, (face_kps, _) in enumerate(ret):
+                            best_matches.append(([face_kps, None], assigned_faces[0], angles[i]))
+
+                self.track.append({
+                    "frame": frame_number,
+                    "target_face_count": len(ret),
+                    "faces_swapped": len(best_matches),
+                    "similarities": [
+                        {"source_index": 0, "sim": 100.0}
+                    ] * len(best_matches),
+                    "angles": [
+                        {"source_index": 0, "angle": angle} for (_, _, angle) in best_matches
+                    ]
+                })
+
+            else:
+                best_matches = []
+                max_sims_per_source = {
+                    i: 0.0 for i, ff in enumerate(self.found_faces) if ff["SourceFaceAssignments"]
+                }
+                match_angles = []
+                matched_indices = set()
+
+                for i, fface in enumerate(ret):
+                    best_sim = 0.0
+                    best_match = None
+                    best_src_idx = None
+
+                    for source_index, found_face in enumerate(self.found_faces):
+                        if not found_face["SourceFaceAssignments"]:
+                            continue
+
+                        sim = self.findCosineDistance(fface[1], found_face["Embedding"])
+                        threshold = float(parameters["ThresholdSlider"])
+
+                        if sim > max_sims_per_source[source_index]:
+                            max_sims_per_source[source_index] = sim
+
+                        if sim > best_sim and sim >= threshold:
+                            best_sim = sim
+                            best_match = (fface, found_face, angles[i])
+                            best_src_idx = source_index
+
+                    if best_match:
+                        best_matches.append(best_match)
+                        match_angles.append({"source_index": best_src_idx, "angle": angles[i]})
+                        matched_indices.add(i)
+
+                # Unified fallback block for any unmatched faces when 2 sources exist
+                assigned_sources = [ff for ff in self.found_faces if ff["SourceFaceAssignments"]]
+                unmatched_indices = set(range(len(ret))) - matched_indices
+
+                if len(assigned_sources) == 2 and unmatched_indices:
+                    fallback_threshold = 40.0
+                    for fallback_idx in unmatched_indices:
+                        fface = ret[fallback_idx]
+                        fallback_angle = angles[fallback_idx]
+
+                        best_sim = 0.0
+                        best_source = None
+                        best_src_idx = None
+
+                        for source_index, found_face in enumerate(self.found_faces):
+                            if not found_face["SourceFaceAssignments"]:
+                                continue
+
+                            sim = self.findCosineDistance(fface[1], found_face["Embedding"])
+                            if sim > fallback_threshold and sim > best_sim:
+                                best_sim = sim
+                                best_source = found_face
+                                best_src_idx = source_index
+
+                        if best_source is not None:
+                            best_matches.append((fface, best_source, fallback_angle))
+                            match_angles.append({"source_index": best_src_idx, "angle": fallback_angle})
+
+                self.track.append({
+                    "frame": frame_number,
+                    "target_face_count": len(ret),
+                    "faces_swapped": len(best_matches),
+                    "similarities": [
+                        {"source_index": idx, "sim": sim}
+                        for idx, sim in max_sims_per_source.items()
+                    ],
+                    "angles": match_angles
+                })
+
+            for fface, found_face, _ in best_matches:
+                s_e = found_face["AssignedEmbedding"]
+                img = self.func_w_test("swap_video", self.swap_core, img, fface[0], s_e, parameters, control)
+
+            img = img.permute(1, 2, 0)
+            if not control['MaskViewButton'] and parameters['OrientSwitch']:
+                img = img.permute(2, 0, 1)
+                img = transforms.functional.rotate(img, angle=-parameters['OrientSlider'], expand=True)
+                img = img.permute(1, 2, 0)
+        else:
+            max_sims_per_source = {
+                i: 0.0 for i, ff in enumerate(self.found_faces) if ff["SourceFaceAssignments"]
+            }
+
+            self.track.append({
+                "frame": frame_number,
+                "target_face_count": 0,
+                "faces_swapped": 0,
+                "similarities": [
+                    {"source_index": idx, "sim": 0.0} for idx in max_sims_per_source
+                ],
+                "angles": []
+            })
+
+            img = img.permute(1, 2, 0)
+            if parameters['OrientSwitch']:
+                img = img.permute(2, 0, 1)
+                img = v2.functional.rotate(img, angle=-parameters['OrientSlider'], interpolation=v2.InterpolationMode.BILINEAR, expand=True)
+                img = img.permute(1, 2, 0)
+
+        if self.perf_test:
+            print('------------------------')
+
+        if img_x < 512 or img_y < 512:
+            tscale = v2.Resize((img_y, img_x), antialias=True)
+            img = img.permute(2, 0, 1)
+            img = tscale(img)
+            img = img.permute(1, 2, 0)
+
+        img = img.cpu().numpy()
+        return img.astype(np.uint8)
+
+
+
+    def findCosineDistance(self, vector1, vector2):
+        cos_dist = 1.0 - np.dot(vector1, vector2)/(np.linalg.norm(vector1)*np.linalg.norm(vector2)) # 2..0
+
+        return 100.0-cos_dist*50.0
+
+
 
     def func_w_test(self, name, func, *args, **argsv):
         timing = time.time()
@@ -642,69 +1157,188 @@ class VideoManager():
         tform.estimate(kps, dst) 
 
         # Scaling Transforms
-        t512 = v2.Resize((512, 512), antialias=False)
-        #t512a = v2.Resize((512, 512), antialias=True)
-        t256 = v2.Resize((256, 256), antialias=False)
-        t128 = v2.Resize((128, 128), antialias=False)
+        t512 = v2.Resize((512, 512), interpolation=v2.InterpolationMode.BILINEAR, antialias=False)
+        t256 = v2.Resize((256, 256), interpolation=v2.InterpolationMode.BILINEAR, antialias=False)
+        t128 = v2.Resize((128, 128), interpolation=v2.InterpolationMode.BILINEAR, antialias=False)
 
         # Grab 512 face from image and create 256 and 128 copys
-        original_face_512 = v2.functional.affine(img, tform.rotation*57.2958, (tform.translation[0], tform.translation[1]) , tform.scale, 0, center = (0,0), interpolation=v2.InterpolationMode.NEAREST ) 
-
+        original_face_512 = v2.functional.affine(img, tform.rotation*57.2958, (tform.translation[0], tform.translation[1]) , tform.scale, 0, center = (0,0), interpolation=v2.InterpolationMode.BILINEAR )
         original_face_512 = v2.functional.crop(original_face_512, 0,0, 512, 512)# 3, 512, 512
         original_face_256 = t256(original_face_512)
-        original_face_128 = t128(original_face_256)  
-
-        # Optional Scaling # change the thransform matrix
-        if parameters['FaceAdjSwitch']:
-            original_face_128 = v2.functional.affine(original_face_128, 0, (0,0) , 1+parameters['FaceScaleSlider']/100, 0, center = (63,63), interpolation=v2.InterpolationMode.BILINEAR) 
-        
+        original_face_128 = t128(original_face_256)
+        # print(f"Rotation angle: {tform.inverse.rotation * 57.2958} degrees")
 
         latent = torch.from_numpy(self.models.calc_swapper_latent(s_e)).float().to('cuda')
 
-        # Prepare for swapper formats
-        swap = torch.reshape(original_face_128, (1, 3, 128, 128)).contiguous()
-        swap = torch.div(swap, 255)
-        # print('1', swap.storage().data_ptr())
+        dim = 1
+        if parameters['SwapperTypeTextSel'] == '128':
+            dim = 1
+            input_face_affined = original_face_128
+        elif parameters['SwapperTypeTextSel'] == '256':
+            dim = 2
+            input_face_affined = original_face_256
+        elif parameters['SwapperTypeTextSel'] == '512':
+            dim = 4
+            input_face_affined = original_face_512
 
+        # Optional Scaling # change the thransform matrix
+        if parameters['FaceAdjSwitch']:
+            input_face_affined = v2.functional.affine(input_face_affined, 0, (0, 0), 1 + parameters['FaceScaleSlider'] / 100, 0, center=(dim*128-1, dim*128-1), interpolation=v2.InterpolationMode.BILINEAR)
 
-        # Swap Face and blend according to Strength
         itex = 1
         if parameters['StrengthSwitch']:
-            itex = ceil(parameters['StrengthSlider']/100.)
+            itex = ceil(parameters['StrengthSlider'] / 100.)
 
-        # Additional swaps based on strength
-        for i in range(itex):
-            prev_swap = swap.clone()
-            self.models.run_swapper(prev_swap, latent, swap)
+        output_size = int(128 * dim)
+        output = torch.zeros((output_size, output_size, 3), dtype=torch.float32, device='cuda')
+        input_face_affined = input_face_affined.permute(1, 2, 0)
+        input_face_affined = torch.div(input_face_affined, 255.0)
+
+        for k in range(itex):
+            for j in range(dim):
+                for i in range(dim):
+                    input_face_disc = input_face_affined[j::dim,i::dim]
+                    input_face_disc = input_face_disc.permute(2, 0, 1)
+                    input_face_disc = torch.unsqueeze(input_face_disc, 0).contiguous()
+
+                    swapper_output = torch.empty((1,3,128,128), dtype=torch.float32, device='cuda').contiguous()
+                    self.models.run_swapper(input_face_disc, latent, swapper_output)
+
+                    swapper_output = torch.squeeze(swapper_output)
+                    swapper_output = swapper_output.permute(1, 2, 0)
+
+
+                    output[j::dim, i::dim] = swapper_output.clone()
+            prev_face = input_face_affined.clone()
+            input_face_affined = output.clone()
+            output = torch.mul(output, 255)
+            output = torch.clamp(output, 0, 255)
+
+
+        output = output.permute(2, 0, 1)
+
+
+        swap = t512(output)
 
         if parameters['StrengthSwitch']:
             if itex == 0:
-                prev_swap = swap.clone()
-            
-            alpha = np.mod(parameters['StrengthSlider'], 100)*0.01            
-            if alpha==0:
-                alpha=1
-            
-            # Blend the images
-            swap = torch.mul(swap, alpha)
-            prev_swap = torch.mul(prev_swap, 1-alpha)
-            swap = torch.add(swap, prev_swap)
+                swap = original_face_512.clone()
+            else:
+                alpha = np.mod(parameters['StrengthSlider'], 100)*0.01
+                if alpha==0:
+                    alpha=1
 
-        # Format to 3x128x128 [0..255] uint8
-        swap = torch.squeeze(swap)
-        swap = torch.mul(swap, 255) # should I carry [0..1] through the pipe insteadf?
-        swap = torch.clamp(swap, 0, 255)
-        swap = swap.type(torch.uint8)
-        swap_128 = swap
-        swap = t512(swap)
+                # Blend the images
+                prev_face = torch.mul(prev_face, 255)
+                prev_face = torch.clamp(prev_face, 0, 255)
+                prev_face = prev_face.permute(2, 0, 1)
+                prev_face = t512(prev_face)
+                swap = torch.mul(swap, alpha)
+                prev_face = torch.mul(prev_face, 1-alpha)
+                swap = torch.add(swap, prev_face)
+
+        def rgb_to_hsv(img):
+            """Convert RGB image to HSV (PyTorch implementation)."""
+            r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+
+            maxc, _ = torch.max(img, dim=2)
+            minc, _ = torch.min(img, dim=2)
+            delta = maxc - minc
+
+            # Hue calculation
+            hue = torch.zeros_like(maxc)
+            mask = delta > 0
+            idx = (maxc == r) & mask
+            hue[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6
+            idx = (maxc == g) & mask
+            hue[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2
+            idx = (maxc == b) & mask
+            hue[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4
+            hue /= 6  # Normalize to 0-1
+            hue[~mask] = 0  # Undefined hue when delta == 0
+
+            # Saturation calculation
+            sat = torch.zeros_like(maxc)
+            sat[maxc > 0] = delta[maxc > 0] / maxc[maxc > 0]
+
+            # Value calculation
+            val = maxc
+
+            return torch.stack([hue, sat, val], dim=2)
+
+        def hsv_to_rgb(img):
+            """Convert HSV image to RGB (PyTorch implementation)."""
+            h, s, v = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+
+            h = (h * 6) % 6  # Convert hue to range [0,6]
+            i = torch.floor(h).to(torch.int32)
+            f = h - i
+            p = v * (1 - s)
+            q = v * (1 - s * f)
+            t = v * (1 - s * (1 - f))
+
+            rgb = torch.stack([
+                torch.where((i == 0) | (i == 5), v,
+                            torch.where((i == 1), q, torch.where((i == 2), p, torch.where((i == 3), p, t)))),
+                torch.where((i == 1) | (i == 2), v,
+                            torch.where((i == 3), q, torch.where((i == 4), p, torch.where((i == 5), p, t)))),
+                torch.where((i == 3) | (i == 4), v,
+                            torch.where((i == 5), q, torch.where((i == 0), p, torch.where((i == 1), p, t))))
+            ], dim=2)
+
+            return rgb
+
+            # swap = torch.squeeze(swap)
+            # swap = torch.mul(swap, 255)
+            # swap = torch.clamp(swap, 0, 255)
+            # # swap_128 = swap
+            # swap = t256(swap)
+            # swap = t512(swap)
+
         
         # Apply color corerctions
+        # is_hsv = parameters.get('HSVSwitchState', False)  # Read from GUI switch
+
+
         if parameters['ColorSwitch']:
+            # Apply gamma correction
+            swap = torch.unsqueeze(swap, 0)
+            swap = v2.functional.adjust_gamma(swap, parameters['ColorGammaSlider'], 1.0)
+            swap = torch.squeeze(swap)
             swap = swap.permute(1, 2, 0).type(torch.float32)
-            del_color = torch.tensor([parameters['ColorRedSlider'], parameters['ColorGreenSlider'], parameters['ColorBlueSlider']], device=device)
-            swap += del_color
-            swap = torch.clamp(swap, min=0., max=255.)
-            swap = swap.permute(2, 0, 1).type(torch.uint8)        
+
+            if parameters['HSVSwitch']:
+                # **Convert to HSV**
+                swap = swap / 255.0  # Normalize before HSV conversion
+                swap_hsv = rgb_to_hsv(swap)
+
+                # **Repurpose RGB sliders for HSV adjustments**
+                h_shift = parameters['ColorRedSlider'] / 720.0  # Convert degrees to normalized shift
+                s_factor = parameters['ColorGreenSlider'] / 200.0  # Convert percentage to scale
+                v_factor = parameters['ColorBlueSlider'] / 100.0  # Convert percentage to scale
+
+                # **Apply adjustments**
+                swap_hsv[:, :, 0] = (swap_hsv[:, :, 0] + h_shift) % 1.0  # Hue shift (wrap around)
+                swap_hsv[:, :, 1] = torch.clamp(swap_hsv[:, :, 1] * (1 + s_factor), 0, 1)  # Saturation scale
+                swap_hsv[:, :, 2] = torch.clamp(swap_hsv[:, :, 2] * (1 + v_factor), 0,
+                                                1)  # **Fixed Brightness scaling**
+
+                # **Convert back to RGB**
+                swap = hsv_to_rgb(swap_hsv)
+                swap = torch.clamp(swap * 255, 0, 255)  # De-normalize
+
+                swap = swap.permute(2, 0, 1).type(torch.uint8)  # Ensure final format
+
+
+            else:
+                # **Original RGB Adjustments (No Changes)**
+                del_color = torch.tensor(
+                    [parameters['ColorRedSlider'], parameters['ColorGreenSlider'], parameters['ColorBlueSlider']],
+                    device=swap.device
+                )
+                swap += del_color
+                swap = torch.clamp(swap, min=0., max=255.)
+                swap = swap.permute(2, 0, 1).type(torch.uint8)
 
         # Create border mask
         border_mask = torch.ones((128, 128), dtype=torch.float32, device=device)
@@ -747,14 +1381,9 @@ class VideoManager():
             mask = t128(mask)  
             swap_mask = torch.mul(swap_mask, mask)
 
-        # Face Parsing
-        if parameters["MouthParserSwitch"]:
-            mask = self.func_w_test('mouth parser', self.apply_face_parser, original_face_512, parameters['MouthParserSlider'])
-            mask = t128(mask)
-            swap_mask = torch.mul(swap_mask, mask)
-            
+
         if parameters["FaceParserSwitch"]:
-            mask = self.func_w_test('bg parser', self.apply_bg_face_parser, swap, parameters["FaceParserSlider"])
+            mask = self.apply_face_parser(swap, parameters["FaceParserSlider"], parameters['MouthParserSlider'])
             mask = t128(mask)
             swap_mask = torch.mul(swap_mask, mask)            
         
@@ -781,7 +1410,6 @@ class VideoManager():
             # Cslculate the area to be mergerd back to the original frame
             IM512 = tform.inverse.params[0:2, :]
             corners = np.array([[0,0], [0,511], [511, 0], [511, 511]])
-
             x = (IM512[0][0]*corners[:,0] + IM512[0][1]*corners[:,1] + IM512[0][2])
             y = (IM512[1][0]*corners[:,0] + IM512[1][1]*corners[:,1] + IM512[1][2])
             
@@ -800,13 +1428,14 @@ class VideoManager():
 
             # Untransform the swap
             swap = v2.functional.pad(swap, (0,0,img.shape[2]-512, img.shape[1]-512))
-            swap = v2.functional.affine(swap, tform.inverse.rotation*57.2958, (tform.inverse.translation[0], tform.inverse.translation[1]), tform.inverse.scale, 0,interpolation=v2.InterpolationMode.NEAREST, center = (0,0) )  
+            swap = v2.functional.affine(swap, tform.inverse.rotation*57.2958, (tform.inverse.translation[0], tform.inverse.translation[1]), tform.inverse.scale, 0,interpolation=v2.InterpolationMode.BILINEAR, center = (0,0) )
             swap = swap[0:3, top:bottom, left:right]
             swap = swap.permute(1, 2, 0)
-            
+
+
             # Untransform the swap mask
             swap_mask = v2.functional.pad(swap_mask, (0,0,img.shape[2]-512, img.shape[1]-512))
-            swap_mask = v2.functional.affine(swap_mask, tform.inverse.rotation*57.2958, (tform.inverse.translation[0], tform.inverse.translation[1]), tform.inverse.scale, 0, interpolation=v2.InterpolationMode.NEAREST, center = (0,0) ) 
+            swap_mask = v2.functional.affine(swap_mask, tform.inverse.rotation*57.2958, (tform.inverse.translation[0], tform.inverse.translation[1]), tform.inverse.scale, 0, interpolation=v2.InterpolationMode.BILINEAR, center = (0,0) )
             swap_mask = swap_mask[0:1, top:bottom, left:right]                        
             swap_mask = swap_mask.permute(1, 2, 0)
             swap_mask = torch.sub(1, swap_mask) 
@@ -910,50 +1539,106 @@ class VideoManager():
         return clip_mask    
         
     # @profile
-    def apply_face_parser(self, img, FaceParserAmount):
+    def apply_face_parser(self, img, FaceAmount, MouthAmount):
 
         # atts = [1 'skin', 2 'l_brow', 3 'r_brow', 4 'l_eye', 5 'r_eye', 6 'eye_g', 7 'l_ear', 8 'r_ear', 9 'ear_r', 10 'nose', 11 'mouth', 12 'u_lip', 13 'l_lip', 14 'neck', 15 'neck_l', 16 'cloth', 17 'hair', 18 'hat']
        
         outpred = torch.ones((512,512), dtype=torch.float32, device='cuda').contiguous()
         
-        # turn mouth parser off at 0 so someone can just use the background parser
-        if FaceParserAmount != 0:        
-            img = torch.div(img, 255)
-            img = v2.functional.normalize(img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-            img = torch.reshape(img, (1, 3, 512, 512))      
-            outpred = torch.empty((1,19,512,512), dtype=torch.float32, device='cuda').contiguous()
-            
-            self.models.run_faceparser(img, outpred)
 
-            outpred = torch.squeeze(outpred)
-            outpred = torch.argmax(outpred, 0)
-            
-            if FaceParserAmount <0:
-                test = torch.tensor([11], device='cuda')
-                iters = int(-FaceParserAmount)
-                
-            elif FaceParserAmount >0:
-                test = torch.tensor([11,12,13], device='cuda')
-                iters = int(FaceParserAmount)
-            
-            outpred = torch.isin(outpred, test)            
-            outpred = torch.clamp(~outpred, 0, 1).type(torch.float32)
-            outpred = torch.reshape(outpred, (1,1,512,512))            
-            outpred = torch.neg(outpred)
-            outpred = torch.add(outpred, 1)
+        img = torch.div(img, 255)
+        img = v2.functional.normalize(img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        img = torch.reshape(img, (1, 3, 512, 512))
+        outpred = torch.empty((1,19,512,512), dtype=torch.float32, device='cuda').contiguous()
+
+        self.models.run_faceparser(img, outpred)
+
+        outpred = torch.squeeze(outpred)
+        outpred = torch.argmax(outpred, 0)
+
+        # Mouth Parse
+        if MouthAmount <0:
+            mouth_idxs = torch.tensor([11], device='cuda')
+            iters = int(-MouthAmount)
+
+            mouth_parse = torch.isin(outpred, mouth_idxs)
+            mouth_parse = torch.clamp(~mouth_parse, 0, 1).type(torch.float32)
+            mouth_parse = torch.reshape(mouth_parse, (1, 1, 512, 512))
+            mouth_parse = torch.neg(mouth_parse)
+            mouth_parse = torch.add(mouth_parse, 1)
+
+            kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32,
+                                device='cuda')
+
+            for i in range(iters):
+                mouth_parse = torch.nn.functional.conv2d(mouth_parse, kernel,
+                                                         padding=(1, 1))
+                mouth_parse = torch.clamp(mouth_parse, 0, 1)
+
+            mouth_parse = torch.squeeze(mouth_parse)
+            mouth_parse = torch.neg(mouth_parse)
+            mouth_parse = torch.add(mouth_parse, 1)
+            mouth_parse = torch.reshape(mouth_parse, (1, 512, 512))
+
+        elif MouthAmount >0:
+            mouth_idxs = torch.tensor([11,12,13], device='cuda')
+            iters = int(MouthAmount)
+
+            mouth_parse = torch.isin(outpred, mouth_idxs)
+            mouth_parse = torch.clamp(~mouth_parse, 0, 1).type(torch.float32)
+            mouth_parse = torch.reshape(mouth_parse, (1,1,512,512))
+            mouth_parse = torch.neg(mouth_parse)
+            mouth_parse = torch.add(mouth_parse, 1)
 
             kernel = torch.ones((1,1,3,3), dtype=torch.float32, device='cuda')
 
             for i in range(iters):
-                outpred = torch.nn.functional.conv2d(outpred, kernel, padding=(1, 1))       
-                outpred = torch.clamp(outpred, 0, 1)
-                
-            outpred = torch.squeeze(outpred)
-            outpred = torch.neg(outpred)
-            outpred = torch.add(outpred, 1)
-        outpred = torch.reshape(outpred, (1, 512, 512))   
-    
-        return outpred
+                mouth_parse = torch.nn.functional.conv2d(mouth_parse, kernel, padding=(1, 1))
+                mouth_parse = torch.clamp(mouth_parse, 0, 1)
+
+            mouth_parse = torch.squeeze(mouth_parse)
+            mouth_parse = torch.neg(mouth_parse)
+            mouth_parse = torch.add(mouth_parse, 1)
+            mouth_parse = torch.reshape(mouth_parse, (1, 512, 512))
+
+        else:
+            mouth_parse = torch.ones((1, 512, 512), dtype=torch.float32, device='cuda')
+
+        # BG Parse
+        bg_idxs = torch.tensor([0, 14, 15, 16, 17, 18], device=device)
+        bg_parse = torch.isin(outpred, bg_idxs)
+        bg_parse = torch.clamp(~bg_parse, 0, 1).type(torch.float32)
+        bg_parse = torch.reshape(bg_parse, (1, 1, 512, 512))
+
+        if FaceAmount > 0:
+            kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=device)
+
+            for i in range(int(FaceAmount)):
+                bg_parse = torch.nn.functional.conv2d(bg_parse, kernel, padding=(1, 1))
+                bg_parse = torch.clamp(bg_parse, 0, 1)
+
+            bg_parse = torch.squeeze(bg_parse)
+
+        elif FaceAmount < 0:
+            bg_parse = torch.neg(bg_parse)
+            bg_parse = torch.add(bg_parse, 1)
+
+            kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=device)
+
+            for i in range(int(-FaceAmount)):
+                bg_parse = torch.nn.functional.conv2d(bg_parse, kernel, padding=(1, 1))
+                bg_parse = torch.clamp(bg_parse, 0, 1)
+
+            bg_parse = torch.squeeze(bg_parse)
+            bg_parse = torch.neg(bg_parse)
+            bg_parse = torch.add(bg_parse, 1)
+            bg_parse = torch.reshape(bg_parse, (1, 512, 512))
+        else:
+            bg_parse = torch.ones((1,512,512), dtype=torch.float32, device='cuda')
+
+        out_parse = torch.mul(bg_parse, mouth_parse)
+
+        return out_parse
 
     def apply_bg_face_parser(self, img, FaceParserAmount):
 
@@ -975,15 +1660,15 @@ class VideoManager():
             outpred = torch.argmax(outpred, 0)
 
             test = torch.tensor([ 0, 14, 15, 16, 17, 18], device=device)
-            outpred = torch.isin(outpred, test)  
-            outpred = torch.clamp(~outpred, 0, 1).type(torch.float32)            
+            outpred = torch.isin(outpred, test)
+            outpred = torch.clamp(~outpred, 0, 1).type(torch.float32)
             outpred = torch.reshape(outpred, (1,1,512,512))
             
             if FaceParserAmount >0:                   
                 kernel = torch.ones((1,1,3,3), dtype=torch.float32, device=device)
 
                 for i in range(int(FaceParserAmount)):
-                    outpred = torch.nn.functional.conv2d(outpred, kernel, padding=(1, 1))       
+                    outpred = torch.nn.functional.conv2d(outpred, kernel, padding=(1, 1))
                     outpred = torch.clamp(outpred, 0, 1)
                 
                 outpred = torch.squeeze(outpred)
@@ -995,7 +1680,7 @@ class VideoManager():
                 kernel = torch.ones((1,1,3,3), dtype=torch.float32, device=device)
 
                 for i in range(int(-FaceParserAmount)):
-                    outpred = torch.nn.functional.conv2d(outpred, kernel, padding=(1, 1))       
+                    outpred = torch.nn.functional.conv2d(outpred, kernel, padding=(1, 1))
                     outpred = torch.clamp(outpred, 0, 1)
                 
                 outpred = torch.squeeze(outpred)
